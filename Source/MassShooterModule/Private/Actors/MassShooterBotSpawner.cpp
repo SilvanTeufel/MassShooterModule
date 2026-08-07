@@ -7,6 +7,8 @@
 #include "Characters/Unit/UnitBase.h"
 #include "GameModes/RTSGameModeBase.h"
 #include "Actors/Waypoint.h"
+#include "Core/UnitData.h"
+#include "Engine/DataTable.h"
 #include "GameFramework/PlayerStart.h"
 
 #include "Kismet/GameplayStatics.h"
@@ -62,6 +64,58 @@ void AMassShooterBotSpawner::BeginPlay()
 
 	GetWorldTimerManager().SetTimer(AuditTimer, this, &AMassShooterBotSpawner::AuditBots,
 		2.f, /*bLoop*/ true);
+}
+
+const FUnitSpawnParameter* AMassShooterBotSpawner::PickSpawnRow()
+{
+	if (!SpawnTable)
+	{
+		return nullptr;
+	}
+
+	TArray<FUnitSpawnParameter*> Rows;
+	SpawnTable->GetAllRows<FUnitSpawnParameter>(TEXT("MassShooterBotSpawner"), Rows);
+	if (Rows.Num() == 0)
+	{
+		return nullptr;
+	}
+
+	RowSpawnCounts.SetNumZeroed(Rows.Num());
+
+	// Whichever row is furthest behind its intended share gets the next spawn. With weights 4 and
+	// 1 that produces melee, melee, melee, melee, ranged and repeats — a stable mix even in a
+	// six-bot wave.
+	float TotalWeight = 0.f;
+	for (const FUnitSpawnParameter* Row : Rows)
+	{
+		TotalWeight += FMath::Max(0, Row->UnitCount);
+	}
+	if (TotalWeight <= 0.f)
+	{
+		return Rows[0];
+	}
+
+	int32 BestIndex = 0;
+	float BestDeficit = -MAX_flt;
+	for (int32 Index = 0; Index < Rows.Num(); ++Index)
+	{
+		const float Share = FMath::Max(0, Rows[Index]->UnitCount) / TotalWeight;
+		if (Share <= 0.f)
+		{
+			continue;
+		}
+
+		// How many spawns this row is owed relative to what it has had.
+		const float Deficit = Share * (SpawnCounter + 1) - RowSpawnCounts[Index];
+		if (Deficit > BestDeficit)
+		{
+			BestDeficit = Deficit;
+			BestIndex = Index;
+		}
+	}
+
+	++RowSpawnCounts[BestIndex];
+	return Rows[BestIndex];
 }
 
 AWaypoint* AMassShooterBotSpawner::GetOrCreateAdvanceWaypoint()
@@ -229,24 +283,43 @@ int32 AMassShooterBotSpawner::SpawnWave(int32 Count, float HealthMultiplier, flo
 
 AUnitBase* AMassShooterBotSpawner::SpawnOne(float HealthMultiplier, float DamageMultiplier)
 {
-	if (!HasAuthority() || !BotClass)
+	if (!HasAuthority())
 	{
 		return nullptr;
 	}
 
-	// Melee-heavy mix, counted rather than rolled: at MeleeShare 0.8 a random draw still produces
-	// runs of four ranged bots often enough to matter, and a wave of six is far too small to
-	// average that out. Picking melee whenever the running ratio has fallen below the target keeps
-	// every wave close to the intended mix.
-	const bool bWantMelee = MeleeBotClass
-		&& (SpawnCounter == 0 ? MeleeShare > 0.f
-			: (float)MeleeSpawnCounter / (float)SpawnCounter < MeleeShare);
+	// The spawn table wins when there is one. Everything the row decides — class, state, waypoint
+	// tag — is read from it; the properties below are the no-table fallback.
+	const FUnitSpawnParameter* Row = PickSpawnRow();
 
-	const TSubclassOf<AUnitBase> ChosenClass = bWantMelee ? MeleeBotClass : BotClass;
-	++SpawnCounter;
-	if (bWantMelee)
+	TSubclassOf<AUnitBase> ChosenClass = Row ? Row->UnitBaseClass : nullptr;
+
+	if (!Row)
 	{
-		++MeleeSpawnCounter;
+		// Melee-heavy mix, counted rather than rolled: at MeleeShare 0.8 a random draw still
+		// produces runs of four ranged bots often enough to matter, and a wave of six is far too
+		// small to average that out. Picking melee whenever the running ratio has fallen below the
+		// target keeps every wave close to the intended mix.
+		const bool bWantMelee = MeleeBotClass
+			&& (SpawnCounter == 0 ? MeleeShare > 0.f
+				: (float)MeleeSpawnCounter / (float)SpawnCounter < MeleeShare);
+
+		ChosenClass = bWantMelee ? MeleeBotClass : BotClass;
+		if (bWantMelee)
+		{
+			++MeleeSpawnCounter;
+		}
+	}
+
+	++SpawnCounter;
+
+	if (!ChosenClass)
+	{
+		UE_LOG(LogMassShooter, Warning,
+			TEXT("%s: nothing to spawn — %s."), *GetName(),
+			Row ? TEXT("the chosen spawn-table row has no UnitBaseClass")
+				: TEXT("no SpawnTable and no BotClass"));
+		return nullptr;
 	}
 
 	UWorld* World = GetWorld();
@@ -291,15 +364,47 @@ AUnitBase* AMassShooterBotSpawner::SpawnOne(float HealthMultiplier, float Damage
 	// entity and reads both, so setting them afterwards leaves the entity on the wrong team.
 	Unit->TeamId = BotTeamId;
 	Unit->SetMeshRotationServer();
-	Unit->UnitState = InitialState;
-	Unit->UnitStatePlaceholder = InitialState;
 
-	// Before FinishSpawning, like team and state: UUnitStateProcessor reads NextWaypoint when it
-	// seeds the patrol fragment, and falls back to the unit's own spawn point when there is none —
-	// which is the difference between advancing on the players and milling about at the spawner.
-	if (AWaypoint* Waypoint = GetOrCreateAdvanceWaypoint())
+	// UnitData::None is the row's "not specified" value, so a row that leaves State blank inherits
+	// the spawner's InitialState rather than spawning the unit into state None.
+	const TEnumAsByte<UnitData::EState> RowState =
+		(Row && Row->State != UnitData::None) ? Row->State : InitialState;
+	const TEnumAsByte<UnitData::EState> RowPlaceholder =
+		(Row && Row->StatePlaceholder != UnitData::None) ? Row->StatePlaceholder : RowState;
+
+	Unit->UnitState = RowState;
+	Unit->UnitStatePlaceholder = RowPlaceholder;
+
+	// The waypoint is assigned BEFORE FinishSpawning, like team and state: UUnitStateProcessor
+	// reads NextWaypoint when it seeds the patrol fragment, and PatrolRandom falls back to the
+	// unit's own spawn point when there is none — the difference between advancing on the players
+	// and milling about at the spawner.
+	//
+	// The row's WaypointTag is matched against AWaypoint::Tag by RTSUnitTemplate's own
+	// ARTSGameModeBase::AssignWaypointToUnit, so waypoints are authored in the level the same way
+	// they are for any other RTS unit.
+	bool bHasWaypoint = false;
+	if (Row && !Row->WaypointTag.IsEmpty())
 	{
-		Unit->NextWaypoint = Waypoint;
+		GameMode->AssignWaypointToUnit(Unit, Row->WaypointTag);
+		bHasWaypoint = Unit->NextWaypoint != nullptr;
+
+		if (!bHasWaypoint)
+		{
+			// Named but absent is worth saying out loud: silently falling back would leave a
+			// misspelled tag looking like it worked while every bot patrolled the wrong place.
+			UE_LOG(LogMassShooter, Warning,
+				TEXT("%s: no AWaypoint in the level has Tag \"%s\" — falling back to the generated advance point."),
+				*GetName(), *Row->WaypointTag);
+		}
+	}
+
+	if (!bHasWaypoint)
+	{
+		if (AWaypoint* Fallback = GetOrCreateAdvanceWaypoint())
+		{
+			Unit->NextWaypoint = Fallback;
+		}
 	}
 
 	UGameplayStatics::FinishSpawningActor(Unit, SpawnTransform);

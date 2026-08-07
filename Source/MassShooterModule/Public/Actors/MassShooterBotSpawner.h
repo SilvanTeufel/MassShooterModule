@@ -32,7 +32,25 @@ public:
 
 	virtual void BeginPlay() override;
 
-	/** Ranged unit class. Any AUnitBase works; AMassShooterBot adds scoring + attribution. */
+	/**
+	 * Spawn table: rows of RTSUnitTemplate's FUnitSpawnParameter.
+	 *
+	 * When set, this is the authority on what spawns — the row supplies the unit class, the state
+	 * to spawn in, and the WaypointTag naming the AWaypoint the bot patrols around. That is
+	 * RTSUnitTemplate's own mechanism (ARTSGameModeBase::AssignWaypointToUnit matches a row's
+	 * WaypointTag against AWaypoint::Tag), so waypoints are placed and named in the level exactly
+	 * as they are for any other RTS unit rather than through something specific to this plugin.
+	 *
+	 * UnitCount is read as a RELATIVE WEIGHT, not a literal count: this spawner is driven by
+	 * waves and population targets that decide how many bots to make, so the table only decides
+	 * the mix. Melee 4 / ranged 1 gives the 80/20 split the example ships with.
+	 *
+	 * Leave unset to fall back to BotClass / MeleeBotClass / MeleeShare below.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MassShooter|Spawner")
+	TObjectPtr<UDataTable> SpawnTable;
+
+	/** Ranged unit class. Used when SpawnTable is unset. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MassShooter|Spawner")
 	TSubclassOf<AUnitBase> BotClass;
 
@@ -124,7 +142,15 @@ protected:
 	/** Previous audit sample per bot, so "did it actually move" is a measurement not a guess. */
 	TMap<TWeakObjectPtr<AUnitBase>, FVector> LastAuditedLocations;
 
-	/** Resolves (and, on first use, creates) the waypoint bots patrol toward. */
+	/**
+	 * Picks the next spawn-table row, weighted by UnitCount.
+	 *
+	 * Counted rather than rolled: at a 4:1 weighting a random draw still hands out runs of four
+	 * ranged bots, and a wave of six is far too small to average that out.
+	 */
+	const struct FUnitSpawnParameter* PickSpawnRow();
+
+	/** Resolves (and, on first use, creates) the fallback waypoint used when no tag matches. */
 	class AWaypoint* GetOrCreateAdvanceWaypoint();
 
 	UPROPERTY(Transient)
@@ -133,6 +159,9 @@ protected:
 	/** Running totals, so MeleeShare produces a stable ratio instead of a random clump. */
 	int32 SpawnCounter = 0;
 	int32 MeleeSpawnCounter = 0;
+
+	/** Per-row spawn tallies for the weighted pick, indexed the same as the cached row list. */
+	TArray<int32> RowSpawnCounts;
 
 	FTimerHandle TopUpTimer;
 };
