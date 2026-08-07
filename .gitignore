@@ -1,0 +1,15 @@
+# This repository tracks the plugin's Source tree only.
+#
+# Everything is ignored by default and Source is re-included, rather than listing what to exclude:
+# a deny-list silently starts tracking Binaries, Intermediate, Saved or DerivedDataCache the first
+# time a build drops something new into the plugin folder.
+/*
+!/.gitignore
+!/Source/
+
+# Build artefacts, in case a tool ever writes them inside Source.
+Source/**/Intermediate/
+Source/**/Binaries/
+Source/**/Saved/
+Source/**/*.pdb
+Source/**/*.user
