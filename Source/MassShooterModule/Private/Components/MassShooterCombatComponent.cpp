@@ -9,6 +9,8 @@
 #include "Characters/Unit/UnitBase.h"
 #include "Controller/PlayerController/ExtendedControllerBase.h"
 #include "Components/WeaponComponent.h"
+#include "Abilities/SwitchWeaponAbility.h"
+#include "Abilities/WeaponAttributeSet.h"
 #include "GAS/GameplayAbilityBase.h"
 #include "Mass/UnitMassTag.h"
 #include "AbilitySystemComponent.h"
@@ -234,10 +236,67 @@ void UMassShooterCombatComponent::Server_Reload_Implementation()
 		return;
 	}
 
+	// Cast-Dauer auf die Nachladezeit der AKTUELLEN Waffe stellen, bevor die Faehigkeit startet -
+	// sonst misst die Cast-Leiste gegen den Vorgabewert 5 s. Der Talent-Multiplikator gehoert
+	// dazu, weil UReloadAbility::GetReloadTime() ihn ebenfalls anwendet.
+	if (const UWeaponComponent* WeaponComp = OwnerUnit->FindComponentByClass<UWeaponComponent>())
+	{
+		float Duration = WeaponComp->GetCurrentWeaponData().ReloadTime;
+		if (const UWeaponAttributeSet* WeaponAttribute = OwnerUnit->GetAbilitySystemComponent()
+			? Cast<UWeaponAttributeSet>(OwnerUnit->GetAbilitySystemComponent()
+				->GetAttributeSet(UWeaponAttributeSet::StaticClass()))
+			: nullptr)
+		{
+			const float Multiplier = WeaponAttribute->GetReloadSpeedMultiplier();
+			if (Multiplier > 0.f)
+			{
+				Duration *= Multiplier;
+			}
+		}
+		SetCastDuration(Duration);
+	}
+
 	// The reload ability is granted in DefaultAbilities and resolved positionally; GAS refuses a
 	// second activation while one is already running, so this is safe to call repeatedly.
 	OwnerUnit->ActivateAbilityByInputID(ReloadAbilitySlot, OwnerUnit->DefaultAbilities,
 		FHitResult(), Cast<APlayerController>(OwnerUnit->GetController()));
+}
+
+void UMassShooterCombatComponent::SetCastDuration(float Seconds)
+{
+	if (OwnerUnit && Seconds > 0.f)
+	{
+		OwnerUnit->CastTime = Seconds;
+	}
+}
+
+bool UMassShooterCombatComponent::TryStartWeaponSwitchAbility()
+{
+	if (!OwnerUnit || (Health && Health->IsDeadShooter()))
+	{
+		return false;
+	}
+
+	const int32 SlotIndex = static_cast<int32>(SwitchWeaponAbilitySlot)
+		- static_cast<int32>(EGASAbilityInputID::AbilityOne);
+	if (!OwnerUnit->DefaultAbilities.IsValidIndex(SlotIndex))
+	{
+		return false;
+	}
+
+	// Cast-Dauer aus der Faehigkeit selbst: SwitchWeaponTime steht auf dem Blueprint-CDO und ist
+	// ein reiner Wert, darf also vom CDO gelesen werden.
+	if (const USwitchWeaponAbility* SwitchCDO =
+		OwnerUnit->DefaultAbilities[SlotIndex]
+			? OwnerUnit->DefaultAbilities[SlotIndex]->GetDefaultObject<USwitchWeaponAbility>()
+			: nullptr)
+	{
+		SetCastDuration(SwitchCDO->GetSwitchWeaponTime());
+	}
+
+	OwnerUnit->ActivateAbilityByInputID(SwitchWeaponAbilitySlot, OwnerUnit->DefaultAbilities,
+		FHitResult(), Cast<APlayerController>(OwnerUnit->GetController()));
+	return true;
 }
 
 void UMassShooterCombatComponent::FireAt(FVector AimLocation)
@@ -463,6 +522,7 @@ void UMassShooterCombatComponent::TickComponent(float DeltaTime, ELevelTick Tick
 	}
 
 	const bool bLocallyControlled = OwnerUnit->IsLocallyControlled();
+
 
 	// ---- Server-only housekeeping ------------------------------------------------------------
 	if (GetOwnerRole() == ROLE_Authority && bAutoReload && Loadout && (!Health || !Health->IsDeadShooter()))

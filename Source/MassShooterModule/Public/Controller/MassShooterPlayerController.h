@@ -200,6 +200,11 @@ protected:
 	/** Throttle for the Shooter.Debug.DrawAim aim-vs-ReplicatedMouseLocation audit line. */
 	float LastAimAuditTime = -100.f;
 
+	/** Reports the weapon panel's runtime state. See Shooter.Debug.LogHud. */
+	void AuditWeaponHUD();
+
+	float LastHudAuditTime = -100.f;
+
 	UPROPERTY(Transient)
 	TObjectPtr<class UWeaponSelectionHUDWidget> WeaponSelectionWidget;
 

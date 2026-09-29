@@ -47,6 +47,47 @@ public:
 	AMassShooterCharacter(const FObjectInitializer& ObjectInitializer);
 
 	virtual void BeginPlay() override;
+
+	/** Richtet den Muendungspunkt ein - auch im Editor-Viewport. */
+	virtual void OnConstruction(const FTransform& Transform) override;
+
+	/**
+	 * Entscheidet, welcher Punkt die Muendung ist, und richtet ihn ein.
+	 *
+	 * Legt man im Blueprint eine eigene Szenenkomponente mit dem Tag "ProjectileSpawn" an - etwa
+	 * indem man sie aus BP_Soldier_Weapon_AH herueberkopiert -, gewinnt DIESE, und die
+	 * mitgelieferte ProjectileSpawnPoint gibt ihren Tag ab. Noetig, weil
+	 * AUnitBase::GetProjectileSpawnLocation schlicht Comps[0] aus GetComponentsByTag nimmt und
+	 * die Komponente aus dem Konstruktor immer vor den Blueprint-Knoten steht.
+	 *
+	 * Ohne eigenen Punkt bleibt ProjectileSpawnPoint zustaendig und bekommt
+	 * ProjectileSpawnRelativeLocation eingetragen.
+	 *
+	 * Gerufen aus OnConstruction UND BeginPlay: OnConstruction deckt Editor und normalen Spawn
+	 * ab, BeginPlay faengt die Faelle, in denen ein Pawn ohne Konstruktionslauf entsteht.
+	 */
+	void ResolveProjectileSpawnPoint();
+
+	/**
+	 * Haengt den Muendungspunkt an den Waffensocket des Skelettmeshs und schiebt ihn um die
+	 * tatsaechliche Laenge des Waffenmeshs nach vorn. Damit folgt der Schussursprung jeder
+	 * Animation, statt starr an der Kapsel zu haengen.
+	 *
+	 * Gibt false zurueck, wenn keine Waffe, kein Socket oder kein Mesh da ist - dann bleibt der
+	 * alte Weg ueber ProjectileSpawnRelativeLocation zustaendig.
+	 */
+	bool UpdateMuzzleFromWeapon();
+
+	/**
+	 * Schaltet den Weg oben ein. Aus bedeutet: alter Zustand, Punkt an der Kapsel, Lauflaenge aus
+	 * FWeaponData::MuzzleSpawnOffset.
+	 *
+	 * WICHTIG: ist das an, muss MassShooterShootAbility fuer MuzzleSpawnOffset Null uebergeben,
+	 * sonst zaehlt die Lauflaenge zweimal (AUnitBase addiert sie erneut, gedreht mit der
+	 * Aktorrotation).
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MassShooter")
+	bool bDeriveMuzzleFromWeaponBounds = true;
 	virtual void Tick(float DeltaSeconds) override;
 	virtual void PossessedBy(AController* NewController) override;
 	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
@@ -170,6 +211,30 @@ public:
 	 */
 	static float ResolveImpactDamage(const AActor* Shooter, float DamageOverride, bool bEnabled);
 
+	/**
+	 * Takes every primitive component of Actor out of the navigation octree.
+	 *
+	 * A shooter moves its pawns continuously, and in Unreal every primitive with collision
+	 * registers in the navigation octree unless bCanEverAffectNavigation is cleared - that is the
+	 * default. On a navmesh with RuntimeGeneration = Dynamic each of those moving primitives
+	 * dirties the tile it sits in, EVERY FRAME. Measured on the example level: ~2 tile rebuilds per
+	 * frame for the whole match, concentrated on exactly the two tiles the two player pawns
+	 * occupied.
+	 *
+	 * A rebuilt tile invalidates every path crossing it, and RTSUnitTemplate's
+	 * UUnitMovementProcessor answers an invalid path by resetting it and setting DesiredVelocity to
+	 * zero. Bots chasing a player therefore held a full-speed move order and a valid destination,
+	 * lost their path as fast as they got one, and stood still - measured for 10 s at a stretch,
+	 * broken only by the 6 s chase-stall watchdog. That is the reported "sometimes they run at me,
+	 * sometimes they just stand there".
+	 *
+	 * RTSUnitTemplate does exactly this for its own always-moving case
+	 * (AConstructionUnit::BeginPlay), so this applies that plugin's own remedy to this module's
+	 * pawns rather than working around it. Buildings are unaffected: nothing here derives from
+	 * ABuildingBase, and RTSUnitTemplate carves those through a separate NavModifier proxy actor.
+	 */
+	static void DetachFromNavigation(AActor* Actor);
+
 	/** See ResolveImpactDamage. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MassShooter|Combat")
 	bool bTreatZeroDamageAsAttackDamage = true;
@@ -249,6 +314,26 @@ protected:
 	 */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "MassShooter", meta = (AllowPrivateAccess = "true"))
 	TObjectPtr<USceneComponent> ProjectileSpawnPoint;
+
+	/**
+	 * Ursprung der Projektile, relativ zur Kapsel.
+	 *
+	 * Warum nicht einfach die Komponente oben verschieben: die ist VisibleAnywhere und stammt aus
+	 * dem C++-Konstruktor. Im Blueprint laesst sie sich deshalb ansehen, aber ihre Transform nicht
+	 * dauerhaft aendern - ein Zug im Viewport sieht aus, als haette er gewirkt, und ist nach dem
+	 * naechsten Kompilieren wieder weg. Beim WeaponModule-Charakter faellt das nicht auf, weil
+	 * dessen ProjectileSpawn ein echter Blueprint-Knoten ist und ueber das SCS gespeichert wird.
+	 *
+	 * Dieser Wert wird in OnConstruction in die Komponente geschrieben, ist also im Editor sofort
+	 * sichtbar und ueberlebt das Kompilieren.
+	 *
+	 * ACHTUNG - das ist nur der halbe Weg: der tatsaechliche Ursprung eines Schusses ist dieser
+	 * Punkt PLUS FWeaponData::MuzzleSpawnOffset der getragenen Waffe (UnitBase.cpp:1903). In
+	 * DT_WeaponData_Soldier_AH stehen dort je Waffe 51 bis 78 in X. Unterschiedliche Lauflaengen
+	 * gehoeren in die Tabelle, der gemeinsame Grundpunkt hierher.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MassShooter", meta = (AllowPrivateAccess = "true"))
+	FVector ProjectileSpawnRelativeLocation = FVector(60.f, 0.f, 40.f);
 
 	/** WeaponModule weapon. Registers its own UWeaponAttributeSet onto our ASC in its BeginPlay. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "MassShooter|Combat", meta = (AllowPrivateAccess = "true"))

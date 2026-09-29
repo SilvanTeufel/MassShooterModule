@@ -3,6 +3,8 @@
 #include "Components/MassShooterLoadoutComponent.h"
 #include "MassShooterLog.h"
 #include "Components/WeaponComponent.h"
+#include "Components/MassShooterCombatComponent.h"
+#include "Characters/MassShooterCharacter.h"
 #include "Abilities/WeaponAttributeSet.h"
 #include "Characters/Unit/UnitBase.h"
 #include "Net/UnrealNetwork.h"
@@ -146,6 +148,29 @@ void UMassShooterLoadoutComponent::CycleWeapon(int32 Delta)
 	const int32 Current = FMath::Max(0, GetCurrentWeaponIndex());
 	// Double modulo so a negative Delta wraps instead of producing a negative index.
 	const int32 Next = ((Current + Delta) % Count + Count) % Count;
+
+	// Vorwaerts geht ueber die Faehigkeit, nicht ueber den direkten Tausch: nur so laufen
+	// Cast-Leiste und Wechsel-Montage, genau wie beim WeaponModule-Charakter.
+	//
+	// Warum nur vorwaerts: USwitchWeaponAbility::PerformSwitchWeapon schaltet fest auf
+	// (CurrentWeaponIndex + 1) und nimmt kein Ziel entgegen. Rueckwaerts bliebe nur, den Index
+	// vorher zu verbiegen - das waere ein kurzzeitig falscher, replizierter Zustand. Deshalb
+	// tauscht das Mausrad nach unten weiterhin stumm; um auch dort einen Cast zu bekommen,
+	// muesste die Faehigkeit im WeaponModule einen Zielindex lernen.
+	if (Next == (Current + 1) % Count)
+	{
+		if (const AMassShooterCharacter* Shooter = Cast<AMassShooterCharacter>(GetOwner()))
+		{
+			if (UMassShooterCombatComponent* Combat = Shooter->GetCombat())
+			{
+				if (Combat->TryStartWeaponSwitchAbility())
+				{
+					return;
+				}
+			}
+		}
+	}
+
 	SelectWeapon(Next);
 }
 

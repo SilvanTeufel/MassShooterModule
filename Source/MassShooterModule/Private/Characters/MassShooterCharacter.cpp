@@ -193,7 +193,39 @@ void AMassShooterCharacter::BeginPlay()
 {
 	Super::BeginPlay();
 
+	ResolveProjectileSpawnPoint();
+
 	ShooterMovement = Cast<UMassShooterMovementComponent>(GetCharacterMovement());
+
+	// See DetachFromNavigation: a pawn that moves every frame must not sit in the navigation
+	// octree, or it rebuilds the tile under itself continuously and every bot pathing to it keeps
+	// losing its path.
+	DetachFromNavigation(this);
+
+	// Re-run once the pawn is fully dressed. The loadout component attaches weapon meshes after
+	// BeginPlay, and a single pass here would miss them - measured: the navmesh kept rebuilding the
+	// two tiles the players stood in even after the BeginPlay pass. One late sweep is enough; the
+	// log line names whatever is still nav-relevant so this does not have to be guessed again.
+	FTimerHandle NavSweepTimer;
+	GetWorldTimerManager().SetTimer(NavSweepTimer, FTimerDelegate::CreateWeakLambda(this, [this]()
+	{
+		FString Remaining;
+		TInlineComponentArray<UPrimitiveComponent*> Primitives(this);
+		for (const UPrimitiveComponent* Primitive : Primitives)
+		{
+			if (Primitive && Primitive->CanEverAffectNavigation())
+			{
+				Remaining += Primitive->GetName() + TEXT(" ");
+			}
+		}
+
+		if (!Remaining.IsEmpty())
+		{
+			UE_LOG(LogMassShooter, Log, TEXT("%s: still navigation-relevant after BeginPlay: %s"),
+				*GetName(), *Remaining);
+			DetachFromNavigation(this);
+		}
+	}), 3.f, /*bLoop*/ false);
 
 	// AUnitBase::BeginPlay calls SetReplicateMovement(false) — correct for an RTS unit whose
 	// transform travels through the Mass bubble, wrong for a CharacterMovement pawn, whose
@@ -718,4 +750,148 @@ void AMassShooterCharacter::DebugApplyDamage(float Amount, AActor* FromInstigato
 	Effect->Modifiers.Add(Mod);
 
 	AbilitySystemComponent->ApplyGameplayEffectToSelf(Effect, 1.f, AbilitySystemComponent->MakeEffectContext());
+}
+
+void AMassShooterCharacter::DetachFromNavigation(AActor* Actor)
+{
+	if (!Actor)
+	{
+		return;
+	}
+
+	TInlineComponentArray<UPrimitiveComponent*> Primitives(Actor);
+	for (UPrimitiveComponent* Primitive : Primitives)
+	{
+		if (Primitive && Primitive->CanEverAffectNavigation())
+		{
+			Primitive->SetCanEverAffectNavigation(false);
+		}
+	}
+}
+
+void AMassShooterCharacter::OnConstruction(const FTransform& Transform)
+{
+	Super::OnConstruction(Transform);
+	ResolveProjectileSpawnPoint();
+}
+
+// Muendungspunkt aus der getragenen Waffe ableiten.
+//
+// Bisher hing ProjectileSpawnPoint an der KAPSEL. Die Kapsel dreht sich mit dem Pawn, folgt aber
+// keiner Animation - die Waffe dagegen haengt an einem Socket des Skelettmeshs und bewegt sich
+// beim Laufen, Zielen und Nachladen deutlich. Der Schuss startete deshalb neben der Waffe statt
+// an ihrem Lauf. Die Laenge wurde bisher je Waffe von Hand in FWeaponData::MuzzleSpawnOffset
+// nachgetragen (51 bis 78 in X) - ein fester Wert in AKTORRAUM, der die Bewegung ebenfalls nicht
+// mitmacht.
+//
+// Hier wird der Punkt stattdessen an den Waffensocket gehaengt und um die tatsaechliche Laenge
+// des Waffenmeshs nach vorn geschoben. Damit folgt er jeder Animation, und die Laenge kommt aus
+// dem Mesh statt aus einer gepflegten Zahl.
+//
+// Die Laufrichtung wird nicht geraten: genommen wird die LAENGSTE Axis der Meshgrenzen, und ihr
+// Sign aus der Lage des Centrelpunkts zum Ursprung - der Griff sitzt im Ursprung, der Lauf
+// ragt zur Gegenseite. Das traegt auch fuer Waffen, die nicht entlang +X modelliert sind.
+//
+// ACHTUNG, sonst zaehlt die Laenge doppelt: MassShooterShootAbility reicht
+// FWeaponData::MuzzleSpawnOffset weiter, und AUnitBase addiert ihn NOCH EINMAL, gedreht mit der
+// Aktorrotation (UnitBase.cpp, FinalSpawnPos). Ist dieser Weg hier aktiv, muss die Faehigkeit
+// dort Null uebergeben - siehe MassShooterShootAbility.
+bool AMassShooterCharacter::UpdateMuzzleFromWeapon()
+{
+	if (!bDeriveMuzzleFromWeaponBounds || !ProjectileSpawnPoint || !WeaponComp || !GetMesh())
+	{
+		return false;
+	}
+
+	const FWeaponData Data = WeaponComp->GetCurrentWeaponData();
+	if (Data.SocketName == NAME_None || !Data.WeaponMesh || !GetMesh()->DoesSocketExist(Data.SocketName))
+	{
+		// Keine Waffe, kein Socket oder kein Mesh: der alte Weg an der Kapsel bleibt zustaendig.
+		return false;
+	}
+
+	const FBoxSphereBounds MeshBounds = Data.WeaponMesh->GetBounds();
+	const FVector Centre  = MeshBounds.Origin;
+	const FVector HalfSize   = MeshBounds.BoxExtent;
+
+	// Laengste Axis bestimmen.
+	int32 Axis = 0;
+	if (HalfSize.Y > HalfSize[Axis]) Axis = 1;
+	if (HalfSize.Z > HalfSize[Axis]) Axis = 2;
+
+	// Sign: dorthin, wo der Meshkoerper vom Ursprung wegragt. Liegt der Centrelpunkt genau im
+	// Ursprung, bleibt +.
+	const float Sign = (Centre[Axis] < 0.f) ? -1.f : 1.f;
+
+	FVector MuzzleLocal = FVector::ZeroVector;
+	MuzzleLocal[Axis] = Centre[Axis] + Sign * HalfSize[Axis];
+
+	ProjectileSpawnPoint->AttachToComponent(GetMesh(),
+		FAttachmentTransformRules::SnapToTargetIncludingScale, Data.SocketName);
+	ProjectileSpawnPoint->SetRelativeLocation(MuzzleLocal);
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[Muendung] Waffe=%s Socket=%s Achse=%d Laenge=%.1f -> relativ=(%.1f, %.1f, %.1f)"),
+		*GetNameSafe(Data.WeaponMesh), *Data.SocketName.ToString(), Axis, HalfSize[Axis] * 2.f,
+		MuzzleLocal.X, MuzzleLocal.Y, MuzzleLocal.Z);
+
+	return true;
+}
+
+void AMassShooterCharacter::ResolveProjectileSpawnPoint()
+{
+	if (!ProjectileSpawnPoint)
+	{
+		return;
+	}
+
+	// Zuerst der Weg ueber die Waffe. Greift er, ist der Punkt gesetzt und haengt am Socket.
+	if (UpdateMuzzleFromWeapon())
+	{
+		static const FName WeaponSpawnTag(TEXT("ProjectileSpawn"));
+		if (!ProjectileSpawnPoint->ComponentTags.Contains(WeaponSpawnTag))
+		{
+			ProjectileSpawnPoint->ComponentTags.Add(WeaponSpawnTag);
+		}
+		return;
+	}
+
+	static const FName SpawnTag(TEXT("ProjectileSpawn"));
+
+	// Traegt ausser unserer eigenen noch eine Komponente den Tag - typischerweise eine, die im
+	// Blueprint angelegt oder aus dem WeaponModule-Charakter herueberkopiert wurde?
+	bool bHasOwnPoint = false;
+	for (UActorComponent* Tagged : GetComponentsByTag(USceneComponent::StaticClass(), SpawnTag))
+	{
+		if (Tagged && Tagged != ProjectileSpawnPoint)
+		{
+			bHasOwnPoint = true;
+			break;
+		}
+	}
+
+	if (bHasOwnPoint)
+	{
+		// Zuruecktreten. AUnitBase::GetProjectileSpawnLocation nimmt Comps[0] aus
+		// GetComponentsByTag, und das waere sonst immer diese Komponente hier: sie stammt aus dem
+		// Konstruktor und steht deshalb vor jedem Blueprint-Knoten in der Liste. Die selbst
+		// angelegte bliebe wirkungslos - genau der Fall, in dem das Herueberkopieren aus dem
+		// WeaponModule nichts bewirkt hat.
+		ProjectileSpawnPoint->ComponentTags.Remove(SpawnTag);
+	}
+	else
+	{
+		// Niemand sonst traegt den Tag, also ist diese Komponente wieder zustaendig. Der Tag wird
+		// hier bewusst neu gesetzt und nicht nur im Konstruktor: wer seinen eigenen Punkt wieder
+		// loescht, soll nicht ohne Muendung dastehen.
+		if (!ProjectileSpawnPoint->ComponentTags.Contains(SpawnTag))
+		{
+			ProjectileSpawnPoint->ComponentTags.Add(SpawnTag);
+		}
+
+		// Der Konstruktor setzt denselben Wert als Vorgabe; hier gewinnt der im Blueprint
+		// eingestellte. Ohne diesen Schritt bliebe ProjectileSpawnRelativeLocation eine Zahl ohne
+		// Wirkung, denn GetProjectileSpawnLocation liest die KOMPONENTE, nicht diese Eigenschaft.
+		ProjectileSpawnPoint->SetRelativeLocation(ProjectileSpawnRelativeLocation);
+	}
 }

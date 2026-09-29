@@ -3,7 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "Hud/HUDBase.h"
+#include "Hud/PathProviderHUD.h"
 #include "MassShooterHUD.generated.h"
 
 class AMassShooterCharacter;
@@ -19,7 +19,20 @@ class AMassShooterPlayerController;
  * good at. Projects that want a designed UI turn bDrawDefaultHUD off in the plugin settings and
  * subclass or replace this.
  *
- * Derives RTSUnitTemplate's AHUDBase, but does NOT draw any of its RTS presentation.
+ * Derives RTSUnitTemplate's APathProviderHUD, but does NOT draw any of its RTS presentation.
+ *
+ * APathProviderHUD rather than its parent AHUDBase for one reason, and it is not drawing: when the
+ * game mode creates an RTS AI player it does
+ * `AIPC->HUDBase = Cast<APathProviderHUD>(AIPC->GetHUD())` (ARTSGameModeBase), and the AI presses
+ * its ability keys through that pointer. A HUD class that is "only" an AHUDBase makes the cast
+ * return null - twice, because the fallback path re-spawns the same configured HUDClass - and the
+ * AI ends up unable to use a single ability. One HUDClass serves both the human and the AI, so the
+ * shooter HUD has to satisfy the stricter of the two.
+ *
+ * The inherited path machinery costs nothing here: APathProviderHUD ships with StopLoading and
+ * DisablePathFindingOnEnemy already true, so its Dijkstra grid is never built and its per-tick
+ * patrol pass never runs unless a Blueprint deliberately turns them on. That grid belongs to
+ * RTSUnitTemplate's pre-Mass movement path, which a shooter does not read.
  *
  * The inheritance is not for the drawing — it is for AHUDBase::SelectedUnits. WeaponModule's
  * UWeaponSelectionHUDWidget casts the player's HUD to AHUDBase and mirrors that array into its
@@ -31,7 +44,7 @@ class AMassShooterPlayerController;
  * bDrawRTSHUD re-enables the inherited drawing for anyone who does want it.
  */
 UCLASS()
-class MASSSHOOTERMODULE_API AMassShooterHUD : public AHUDBase
+class MASSSHOOTERMODULE_API AMassShooterHUD : public APathProviderHUD
 {
 	GENERATED_BODY()
 
@@ -39,6 +52,25 @@ public:
 	AMassShooterHUD();
 
 	virtual void DrawHUD() override;
+	virtual void BeginPlay() override;
+
+	/**
+	 * Designed replacement for the Canvas vitals, ammo and ability bar.
+	 *
+	 * Set it and those three stop being drawn on the Canvas - the widget owns them instead, which
+	 * is what lets a project apply its own panel materials and fonts to the parts of the HUD a
+	 * player stares at. Leave it unset and nothing changes: the Canvas keeps drawing everything,
+	 * so the plugin still looks complete with no content at all.
+	 *
+	 * Crosshair, kill feed, match banner, damage indicators and scoreboard stay on the Canvas
+	 * either way.
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "MassShooter|HUD")
+	TSubclassOf<class UMassShooterHudWidget> HudWidgetClass;
+
+	/** The live instance of HudWidgetClass, or null when none was configured. */
+	UPROPERTY(Transient, BlueprintReadOnly, Category = "MassShooter|HUD")
+	TObjectPtr<class UMassShooterHudWidget> HudWidget;
 
 	/**
 	 * Also run AHUDBase's RTS drawing (selection rectangle, unit indicators, health bars).

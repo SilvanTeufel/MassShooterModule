@@ -38,6 +38,11 @@ void AMassShooterBot::BeginPlay()
 {
 	Super::BeginPlay();
 
+	// Bots move continuously too, and there are dozens of them. See
+	// AMassShooterCharacter::DetachFromNavigation for what leaving them in the navigation octree
+	// costs on a navmesh with RuntimeGeneration = Dynamic.
+	AMassShooterCharacter::DetachFromNavigation(this);
+
 	// Perception range MUST be widened before the entity is created: the binding component's
 	// SightRadius/LoseSightRadius are copied into FMassCombatStatsFragment at build time, so a
 	// later change would not reach the entity. See SightRadiusOverride for why the RTS default

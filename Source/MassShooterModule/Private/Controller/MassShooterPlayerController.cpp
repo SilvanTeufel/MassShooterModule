@@ -15,9 +15,20 @@
 
 // WeaponModule (read-only use).
 #include "Components/WeaponHUDComponent.h"
+#include "Components/WeaponComponent.h"
 #include "UI/WeaponSelectionHUDWidget.h"
+#include "Hud/HUDBase.h"
+
+namespace
+{
+	int32 GLogHud = 0;
+	FAutoConsoleVariableRef CVarLogHud(
+		TEXT("Shooter.Debug.LogHud"), GLogHud,
+		TEXT("1 = log the weapon panel's runtime state once a second."), ECVF_Cheat);
+}
 
 #include "EngineUtils.h"
+#include "Engine/GameViewportClient.h"  // ViewportClient->GetViewportSize braucht den vollstaendigen Typ
 #include "Blueprint/UserWidget.h"
 #include "UObject/ConstructorHelpers.h"
 
@@ -108,6 +119,140 @@ void AMassShooterPlayerController::BeginPlay()
 	}
 }
 
+void AMassShooterPlayerController::AuditWeaponHUD()
+{
+	// Reports the weapon panel's ACTUAL runtime state rather than its preconditions.
+	//
+	// Every static check on this passed — the widget class is set, the panel count is 3, the pawn
+	// carries a UWeaponComponent, the HUD derives AHUDBase — while the panel stayed invisible. The
+	// values below are the ones UWeaponSelectionHUDWidget::UpdateSelection actually reads.
+	static IConsoleVariable* CVar =
+		IConsoleManager::Get().FindConsoleVariable(TEXT("Shooter.Debug.LogHud"));
+	if (!CVar || CVar->GetInt() == 0)
+	{
+		return;
+	}
+
+	const float Now = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.f;
+	if (Now - LastHudAuditTime < 1.f)
+	{
+		return;
+	}
+	LastHudAuditTime = Now;
+
+	AHUDBase* HudBase = Cast<AHUDBase>(GetHUD());
+	const int32 SelectedCount = HudBase ? HudBase->SelectedUnits.Num() : -1;
+	const bool bSelectedHasWeapon = HudBase && HudBase->SelectedUnits.Num() > 0
+		&& HudBase->SelectedUnits[0]
+		&& HudBase->SelectedUnits[0]->FindComponentByClass<UWeaponComponent>() != nullptr;
+
+	// The panel's own internals, read through the reflection system.
+	//
+	// WeaponHUDWidgets, WeaponHUDContainer and ControllerBase are protected, and they are exactly
+	// the three values that decide whether anything renders. Guessing at them cost two wrong
+	// hypotheses already, so they get read rather than inferred. WeaponModule stays untouched —
+	// this only looks at UPROPERTYs it already publishes to the engine.
+	int32 PanelCount = -1;
+	int32 ContainerSet = -1;
+	int32 ControllerSet = -1;
+	if (WeaponSelectionWidget)
+	{
+		UClass* WidgetClass = WeaponSelectionWidget->GetClass();
+		if (FArrayProperty* Panels = FindFProperty<FArrayProperty>(WidgetClass, TEXT("WeaponHUDWidgets")))
+		{
+			FScriptArrayHelper Helper(Panels, Panels->ContainerPtrToValuePtr<void>(WeaponSelectionWidget));
+			PanelCount = Helper.Num();
+		}
+		if (FObjectPropertyBase* Container = FindFProperty<FObjectPropertyBase>(WidgetClass, TEXT("WeaponHUDContainer")))
+		{
+			ContainerSet = Container->GetObjectPropertyValue_InContainer(WeaponSelectionWidget) != nullptr;
+		}
+		if (FObjectPropertyBase* Ctrl = FindFProperty<FObjectPropertyBase>(WidgetClass, TEXT("ControllerBase")))
+		{
+			ControllerSet = Ctrl->GetObjectPropertyValue_InContainer(WeaponSelectionWidget) != nullptr;
+		}
+	}
+
+	// Where the first panel actually ended up. Everything upstream reports healthy, so the
+	// remaining possibilities are all geometric: collapsed, zero-sized, or laid out off-screen.
+	FString PanelGeom = TEXT("n/a");
+	if (WeaponSelectionWidget)
+	{
+		if (FArrayProperty* Panels = FindFProperty<FArrayProperty>(WeaponSelectionWidget->GetClass(), TEXT("WeaponHUDWidgets")))
+		{
+			FScriptArrayHelper Helper(Panels, Panels->ContainerPtrToValuePtr<void>(WeaponSelectionWidget));
+			if (Helper.Num() > 0)
+			{
+				if (UWidget* Panel = *reinterpret_cast<UWidget**>(Helper.GetRawPtr(0)))
+				{
+					const FGeometry& G = Panel->GetCachedGeometry();
+					const FVector2D Pos = G.GetAbsolutePosition();
+					const FVector2D Size = G.GetLocalSize();
+					// Absolute Slate coordinates are desktop-space for a windowed game, so the
+					// panel's position only means anything relative to the root widget and the
+					// viewport size.
+					const FVector2D RootPos = WeaponSelectionWidget->GetCachedGeometry().GetAbsolutePosition();
+					FVector2D Viewport = FVector2D::ZeroVector;
+					if (GetLocalPlayer() && GetLocalPlayer()->ViewportClient)
+					{
+						GetLocalPlayer()->ViewportClient->GetViewportSize(Viewport);
+					}
+					// Root SIZE is the disambiguator: if the root fills the viewport then its
+					// absolute position is the viewport origin, and the panel's offset from it is
+					// its on-screen position. If it does not, the panel is laid out somewhere the
+					// player cannot see.
+					const FVector2D RootSize = WeaponSelectionWidget->GetCachedGeometry().GetLocalSize();
+					PanelGeom = FString::Printf(
+						TEXT("vis=%d size=(%.0f,%.0f) relToRoot=(%.0f,%.0f) rootAbs=(%.0f,%.0f) rootSize=(%.0f,%.0f) viewport=(%.0f,%.0f)"),
+						(int32)Panel->GetVisibility(), Size.X, Size.Y,
+						Pos.X - RootPos.X, Pos.Y - RootPos.Y,
+						RootPos.X, RootPos.Y, RootSize.X, RootSize.Y, Viewport.X, Viewport.Y);
+				}
+			}
+		}
+	}
+
+	UE_LOG(LogMassShooter, Log, TEXT("HUD AUDIT panel0: %s"), *PanelGeom);
+
+	// Walk the panel's ancestors and print each one's visibility.
+	//
+	// ESlateVisibility::Hidden is the one state that reproduces every measurement taken so far: a
+	// hidden widget still participates in layout, so its children keep valid non-zero geometry and
+	// report Visible, yet nothing in that subtree is drawn. If an ancestor is Hidden, this finds
+	// which one.
+	if (WeaponSelectionWidget)
+	{
+		if (FArrayProperty* Panels = FindFProperty<FArrayProperty>(WeaponSelectionWidget->GetClass(), TEXT("WeaponHUDWidgets")))
+		{
+			FScriptArrayHelper Helper(Panels, Panels->ContainerPtrToValuePtr<void>(WeaponSelectionWidget));
+			if (Helper.Num() > 0)
+			{
+				FString Chain;
+				UWidget* Node = *reinterpret_cast<UWidget**>(Helper.GetRawPtr(0));
+				int32 Depth = 0;
+				while (Node && Depth < 12)
+				{
+					Chain += FString::Printf(TEXT("%s(vis=%d,op=%.2f) < "),
+						*Node->GetName(), (int32)Node->GetVisibility(), Node->GetRenderOpacity());
+					Node = Node->GetParent();
+					++Depth;
+				}
+				UE_LOG(LogMassShooter, Log, TEXT("HUD AUDIT chain: %s"), *Chain);
+			}
+		}
+	}
+
+	UE_LOG(LogMassShooter, Log,
+		TEXT("HUD AUDIT: widget=%d inViewport=%d vis=%d hudIsAHUDBase=%d selected=%d hasWeapon=%d | panels=%d container=%d ctrl=%d"),
+		WeaponSelectionWidget != nullptr,
+		WeaponSelectionWidget ? (int32)WeaponSelectionWidget->IsInViewport() : -1,
+		WeaponSelectionWidget ? (int32)WeaponSelectionWidget->GetVisibility() : -1,
+		HudBase != nullptr,
+		SelectedCount,
+		(int32)bSelectedHasWeapon,
+		PanelCount, ContainerSet, ControllerSet);
+}
+
 void AMassShooterPlayerController::SetupWeaponModuleHUD()
 {
 	if (!WeaponSelectionWidgetClass || WeaponSelectionWidget || !WeaponHUD)
@@ -183,6 +328,8 @@ void AMassShooterPlayerController::Tick(float DeltaSeconds)
 		const float Right = (IsInputKeyDown(EKeys::D) ? 1.f : 0.f) - (IsInputKeyDown(EKeys::A) ? 1.f : 0.f);
 		ApplyMoveInput(Forward, Right);
 	}
+
+	AuditWeaponHUD();
 
 	// Keep the RTS "mouse world position" pointed at the crosshair.
 	//

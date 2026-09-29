@@ -12,6 +12,10 @@
 
 #include "Engine/World.h"
 #include "TimerManager.h"
+#include "Animations/UnitBaseAnimInstance.h"  // Anzeige-Zustand fuer die Schussanimation
+#include "Components/SkeletalMeshComponent.h"
+#include "Mass/UnitMassTag.h"                 // FMassStateContinuousAttackTag
+#include "MassEntityManager.h"
 
 UMassShooterShootAbility::UMassShooterShootAbility()
 {
@@ -23,12 +27,55 @@ UMassShooterShootAbility::UMassShooterShootAbility()
 	// NOT continuous: bIsContinuousAbility makes UGameplayAbilityBase tag the unit with
 	// FMassStateContinuousAttackTag and hand firing to the RTS attack state, which aims at a
 	// perceived target rather than at the crosshair.
+	//
+	// Die ANZEIGE-Haelfte dieses Flags brauchen wir aber trotzdem, sonst spielt die
+	// Schussanimation nur einmal je Eintritt in Attack. Deshalb setzt SetContinuousAttackTag den
+	// Tag selbst - ohne das Flag und damit ohne den fremden Feuerpfad.
 	bIsContinuousAbility = false;
 }
 
 AUnitBase* UMassShooterShootAbility::GetShootingUnit() const
 {
 	return Cast<AUnitBase>(GetAvatarActorFromActorInfo());
+}
+
+void UMassShooterShootAbility::SetContinuousAttackTag(bool bAdd)
+{
+	AUnitBase* Unit = GetShootingUnit();
+	if (!Unit)
+	{
+		return;
+	}
+
+	FMassEntityManager* EntityManager = nullptr;
+	FMassEntityHandle Entity;
+	if (!Unit->GetMassEntityData(EntityManager, Entity) || !EntityManager || !Entity.IsSet()
+		|| !EntityManager->IsEntityValid(Entity))
+	{
+		return;
+	}
+
+	if (bAdd)
+	{
+		// Nullen wie in AExtendedControllerBase::BatchSetRotateToMouseTagLocally, damit der Zyklus
+		// am Anfang steht und nicht mitten in einer Schussphase.
+		//
+		// WICHTIG: auf einem Client wirkt das hier NICHT - dort nullt
+		// ApplyReplicatedTagBits (UnitMassTag.h) den Timer bei Ankunft des Tags noch einmal
+		// selbst. Wie lang die anfaengliche Zielphase ist, entscheidet daher allein
+		// ContinuousAttackStartDelayMultiplier am AnimInstance; fuer den MassShooter steht der
+		// in BP_AnimInst_Soldier_AH_MassShooter auf 0, damit schon der ERSTE Schuss die
+		// Schussanimation zeigt (beim WeaponModule bleibt er auf 0,8).
+		if (FMassAIStateFragment* StateFrag = EntityManager->GetFragmentDataPtr<FMassAIStateFragment>(Entity))
+		{
+			StateFrag->StateTimerClient = 0.f;
+		}
+		EntityManager->Defer().AddTag<FMassStateContinuousAttackTag>(Entity);
+	}
+	else
+	{
+		EntityManager->Defer().RemoveTag<FMassStateContinuousAttackTag>(Entity);
+	}
 }
 
 bool UMassShooterShootAbility::ResolveAimPoint(FVector& OutAim) const
@@ -86,6 +133,31 @@ void UMassShooterShootAbility::ActivateAbility(const FGameplayAbilitySpecHandle 
 		return;
 	}
 
+	// Feuertakt auf die Einheit schreiben, BEVOR der Tag gesetzt wird: an
+	// AAbilityUnit::ContinuousAttackDuration haengt der Zyklus in ComputeState und die PlayRate im
+	// UnitAnimationProcessor. Beim WeaponModule fuellt UWeaponComponent diesen Wert
+	// (WeaponComponent.cpp: FireRate * FireRateMultiplier); ist dort nichts gelaufen, stuende hier
+	// der Vorgabewert 1.0 und die Animation liefe im falschen Takt.
+	{
+		TSubclassOf<AProjectile> RateProjectileClass;
+		FWeaponData RateWeaponData;
+		float RateExtraDamage = 0.f;
+		int32 RateMaxPierced = 1;
+		TSubclassOf<UGameplayEffect> RateEffect1, RateEffect2, RateEffect3;
+
+		if (AAbilityUnit* AbilityUnit = Cast<AAbilityUnit>(GetShootingUnit()))
+		{
+			if (GetShootInfo(RateProjectileClass, RateWeaponData, RateExtraDamage, RateMaxPierced,
+				RateEffect1, RateEffect2, RateEffect3))
+			{
+				AbilityUnit->ContinuousAttackDuration = FMath::Max(0.02f,
+					RateWeaponData.FireRate * FMath::Max(0.01f, RateWeaponData.FireRateMultiplier));
+			}
+		}
+	}
+
+	SetContinuousAttackTag(true);
+
 	// The first round leaves NOW, not one interval from now.
 	//
 	// WeaponModule's Blueprint arms its looping timer and waits for the first callback, so a pull
@@ -121,6 +193,12 @@ void UMassShooterShootAbility::EndAbility(const FGameplayAbilitySpecHandle Handl
 		World->GetTimerManager().ClearTimer(FireTimer);
 	}
 
+	// Zwingend: der Tag hat in ComputeState die hoechste Prioritaet nach Dead. Bleibt er liegen,
+	// sieht die Einheit dauerhaft schiessend aus - auch im Laufen und im Stillstand.
+	// UMassShooterCombatComponent::Server_StopFire entfernt ihn zusaetzlich; das ist Absicht, denn
+	// ein Abbruch, der einen Frame zu spaet landet, darf den Tag nicht stehen lassen.
+	SetContinuousAttackTag(false);
+
 	Super::EndAbility(Handle, ActorInfo, ActivationInfo, bReplicateEndAbility, bWasCancelled);
 }
 
@@ -146,6 +224,22 @@ void UMassShooterShootAbility::FireOneRound()
 		return;
 	}
 
+	// Die Schussanimation laeuft NICHT mehr je Schuss von hier aus.
+	//
+	// Bis Change 545 stand hier ein SetAnimStateOverride(UnitData::Attack, Haltezeit) je Schuss.
+	// Das konnte nicht mehr als ein Zucken je Schuss erzeugen, weil der Zustandsautomat die
+	// Animation bei jedem Eintritt in Attack neu startet und dazwischen eine Luecke braucht -
+	// sichtbar als "Mischung aus Schuss- und Idle-Animation".
+	//
+	// Stattdessen traegt jetzt FMassStateContinuousAttackTag den ganzen Feuerstoss, gesetzt in
+	// ActivateAbility und entfernt in EndAbility. Damit laeuft genau dieselbe Mechanik wie beim
+	// WeaponModule-Charakter: ComputeState wechselt zyklisch zwischen ContinousAttack und Aim und
+	// der UnitAnimationProcessor stellt PlayRate und Startposition auf den Feuertakt ein.
+	//
+	// AttackAnimHoldSeconds und AttackAnimDutyCycle bleiben als Eigenschaften bestehen, wirken auf
+	// diesem Weg aber nicht mehr - den Takt bestimmen ContinuousAttackDuration und die drei
+	// Continuous*-Werte am AnimInstance (SpeedMultiplier, StartDelayMultiplier, CycleRatio).
+
 	// Out of ammo ends the burst rather than firing blanks. The combat component's auto-reload
 	// picks it up from there.
 	const UWeaponAttributeSet* WeaponAttributes = GetWeaponAttributeSet();
@@ -169,6 +263,9 @@ void UMassShooterShootAbility::FireOneRound()
 	// The aim keeps its Z. That single difference from WeaponModule's Blueprint is the whole point
 	// of this class: SpawnProjectileFromClassWithAim builds the flight direction as
 	// (aim - muzzle) and preserves whatever height the caller passes in.
+	const AMassShooterCharacter* Shooter = Cast<AMassShooterCharacter>(Unit);
+	const bool bMuzzleFromBounds = Shooter && Shooter->bDeriveMuzzleFromWeaponBounds;
+
 	Unit->SpawnProjectileFromClassWithAim(
 		Aim,
 		ProjectileClass,
@@ -179,7 +276,10 @@ void UMassShooterShootAbility::FireOneRound()
 		/*IsBouncingBack*/ false,
 		AimZOffset,
 		/*Scale*/ 1.f,
-		WeaponData.MuzzleSpawnOffset,
+		// Null, sobald der MuzzleLocalspunkt aus den Waffenmassen kommt: AUnitBase addiert diesen
+		// Versatz NOCH EINMAL und dreht ihn mit der AKTORrotation, nicht mit dem Socket. Beides
+		// zusammen haette die Lauflaenge verdoppelt und waere der Animation trotzdem nicht gefolgt.
+		bMuzzleFromBounds ? FVector::ZeroVector : WeaponData.MuzzleSpawnOffset,
 		ExtraDamage,
 		Effect1, Effect2, Effect3,
 		AreaInfo);

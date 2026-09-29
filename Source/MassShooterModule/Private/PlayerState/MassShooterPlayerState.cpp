@@ -13,6 +13,7 @@ void AMassShooterPlayerState::GetLifetimeReplicatedProps(TArray<FLifetimePropert
 {
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 
+	DOREPLIFETIME(AMassShooterPlayerState, bIsAiPlayer);
 	DOREPLIFETIME(AMassShooterPlayerState, ShooterTeamId);
 	DOREPLIFETIME(AMassShooterPlayerState, Kills);
 	DOREPLIFETIME(AMassShooterPlayerState, Deaths);

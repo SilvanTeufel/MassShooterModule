@@ -82,6 +82,46 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MassShooter|Spawner|Advance")
 	float AdvanceWanderRadius = 2500.f;
 
+	/**
+	 * Give spawned units that are not AMassShooterBot the shooter's health component.
+	 *
+	 * The spawn table takes any AUnitBase, which is the point: a project that already has RTS
+	 * units (the Xeno faction, say) should be able to field them as the shooter's hostiles without
+	 * reparenting a single Blueprint. What those units lack is UMassShooterHealthComponent, and
+	 * that component is the entire death path of this module - the game mode subscribes to its
+	 * OnDeath to run the kill feed and the scoreboard, and its per-second sweep picks up whatever
+	 * carries one. Attaching it here is therefore the difference between a wave that scores and a
+	 * wave that merely dies quietly.
+	 *
+	 * The attached component is set to observe only (bOverrideStatsOnStart = false), so the unit
+	 * keeps the health its own attribute table gave it. Wave scaling is applied separately, on the
+	 * attribute set, for exactly the same reason.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MassShooter|Spawner")
+	bool bAdaptForeignUnits = true;
+
+	/**
+	 * Sight radius forced onto adapted foreign units.
+	 *
+	 * This is the single reason a wave of RTS units looks like "nothing spawned". An RTS unit is
+	 * tuned for a commander who walks it into contact, so it sees about 900 uu; measured on the
+	 * Xenocrypta Skitterling. A shooter's hostiles spawn at the map edge and have to cross the
+	 * arena on their own. At 900 uu they march to their advance point, arrive, drop into
+	 * PatrolIdle with no target, and stand there forever while the player - 6100 uu away in his
+	 * corner - never sees a single one.
+	 *
+	 * AMassShooterBot solves this for itself in BeginPlay (SightRadiusOverride). A foreign unit has
+	 * no such override, so the spawner applies it, and it MUST happen before FinishSpawning: the
+	 * binding component's SightRadius is copied into FMassCombatStatsFragment when the unit's
+	 * BeginPlay builds the Mass entity, so a later write never reaches the entity.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MassShooter|Spawner")
+	float ForeignUnitSightRadius = 7000.f;
+
+	/** Distance at which an adapted foreign unit drops an acquired target. Kept above the sight radius. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MassShooter|Spawner")
+	float ForeignUnitLoseSightRadius = 9000.f;
+
 	/** Team the spawned bots fight for. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MassShooter|Spawner")
 	int32 BotTeamId = 9;
@@ -139,6 +179,9 @@ protected:
 
 	FTimerHandle AuditTimer;
 
+	/** Seconds between audit samples; see Shooter.Debug.LogBots. */
+	float AuditInterval = 2.f;
+
 	/** Previous audit sample per bot, so "did it actually move" is a measurement not a guess. */
 	TMap<TWeakObjectPtr<AUnitBase>, FVector> LastAuditedLocations;
 
@@ -149,6 +192,18 @@ protected:
 	 * ranged bots, and a wave of six is far too small to average that out.
 	 */
 	const struct FUnitSpawnParameter* PickSpawnRow();
+
+	/**
+	 * Makes a spawned non-AMassShooterBot unit participate in the shooter's match systems.
+	 * See bAdaptForeignUnits.
+	 */
+	void AdaptForeignUnit(AUnitBase* Unit, float HealthMultiplier, float DamageMultiplier);
+
+	/**
+	 * Perception and detection for a foreign unit. Separate from AdaptForeignUnit because it has to
+	 * run BEFORE FinishSpawning - see ForeignUnitSightRadius.
+	 */
+	void PrepareForeignUnitPerception(AUnitBase* Unit);
 
 	/** Resolves (and, on first use, creates) the fallback waypoint used when no tag matches. */
 	class AWaypoint* GetOrCreateAdvanceWaypoint();

@@ -1,6 +1,7 @@
 // Copyright 2026 Silvan Teufel / Teufel-Engineering.com All Rights Reserved.
 
 #include "Hud/MassShooterHUD.h"
+#include "UI/MassShooterHudWidget.h"
 #include "Characters/MassShooterCharacter.h"
 #include "Controller/MassShooterPlayerController.h"
 #include "Components/MassShooterCombatComponent.h"
@@ -117,6 +118,25 @@ void AMassShooterHUD::RefreshWeaponSelection()
 	}
 }
 
+void AMassShooterHUD::BeginPlay()
+{
+	Super::BeginPlay();
+
+	// Local player only: a HUD exists server-side for every AI player the RTS game mode creates
+	// (that is what AIPC->HUDBase points at), and giving those a viewport widget would stack five
+	// invisible HUDs on the listen server's screen.
+	if (!HudWidgetClass || !PlayerOwner || !PlayerOwner->IsLocalPlayerController())
+	{
+		return;
+	}
+
+	HudWidget = CreateWidget<UMassShooterHudWidget>(PlayerOwner, HudWidgetClass);
+	if (HudWidget)
+	{
+		HudWidget->AddToViewport();
+	}
+}
+
 void AMassShooterHUD::DrawHUD()
 {
 	// AHUDBase's own drawing is the RTS presentation — selection rectangle, unit indicators,
@@ -148,9 +168,14 @@ void AMassShooterHUD::DrawHUD()
 	DrawMatchBanner(GS);
 	DrawObjectives(GS);
 	DrawKillFeed(GS);
-	DrawVitals(Pawn);
-	DrawAmmo(Pawn);
-	DrawAbilityBar(Pawn);
+
+	// Whatever the widget owns must not also be drawn here, or the two overlap on screen.
+	if (!HudWidget)
+	{
+		DrawVitals(Pawn);
+		DrawAmmo(Pawn);
+		DrawAbilityBar(Pawn);
+	}
 	DrawDamageIndicators();
 	DrawCrosshair(Pawn);
 	DrawRespawnPrompt(Pawn);
@@ -566,7 +591,19 @@ void AMassShooterHUD::DrawScoreboard(AMassShooterGameState* GS)
 	const float PanelY = 130.f;
 	const float RowHeight = 24.f;
 
-	const int32 RowCount = GS->PlayerArray.Num();
+	// Human rows only. The RTS AI commanders on this map each own a player state, and drawing them
+	// filled the board with empty lines - five of them on Level_14.
+	TArray<AMassShooterPlayerState*> Rows;
+	for (const TObjectPtr<APlayerState>& State : GS->PlayerArray)
+	{
+		AMassShooterPlayerState* ShooterState = Cast<AMassShooterPlayerState>(State.Get());
+		if (ShooterState && !ShooterState->bIsAiPlayer)
+		{
+			Rows.Add(ShooterState);
+		}
+	}
+
+	const int32 RowCount = Rows.Num();
 	const float PanelHeight = 70.f + RowHeight * FMath::Max(1, RowCount);
 
 	DrawRect(FLinearColor(0.02f, 0.03f, 0.05f, 0.88f), PanelX, PanelY, PanelWidth, PanelHeight);
@@ -578,16 +615,7 @@ void AMassShooterHUD::DrawScoreboard(AMassShooterGameState* GS)
 	DrawShadowedText(TEXT("DEATHS"), PanelX + 540.f, PanelY + 16.f, ColorDim);
 	DrawShadowedText(TEXT("SCORE"),  PanelX + 640.f, PanelY + 16.f, ColorDim);
 
-	// Sort a local copy: PlayerArray order is join order, which is not a ranking.
-	TArray<AMassShooterPlayerState*> Rows;
-	Rows.Reserve(RowCount);
-	for (const TObjectPtr<APlayerState>& State : GS->PlayerArray)
-	{
-		if (AMassShooterPlayerState* ShooterState = Cast<AMassShooterPlayerState>(State.Get()))
-		{
-			Rows.Add(ShooterState);
-		}
-	}
+	// PlayerArray order is join order, which is not a ranking.
 	Rows.Sort([](const AMassShooterPlayerState& A, const AMassShooterPlayerState& B)
 	{
 		return A.MatchScore > B.MatchScore;

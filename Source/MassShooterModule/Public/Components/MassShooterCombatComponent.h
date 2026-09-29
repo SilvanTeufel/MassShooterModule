@@ -80,6 +80,32 @@ public:
 	UFUNCTION(BlueprintPure, Category = "MassShooter|Combat")
 	AActor* GetAimTarget() const { return CachedAimTarget.Get(); }
 
+	/**
+	 * Setzt AUnitBase::CastTime auf die echte Dauer des gleich startenden Casts.
+	 *
+	 * Ohne das steht dort der Vorgabewert 5 s, waehrend ein Nachladen 1,4 bis 2,2 s dauert
+	 * (DT_WeaponData_Soldier_AH). Die Cast-Leiste teilt UnitControlTimer durch CastTime - sie
+	 * liefe also nur bis rund ein Drittel und verschwaende dann, weil die Faehigkeit laengst
+	 * fertig ist. Gemessen am 27.09.2026.
+	 *
+	 * Weder ReloadAbility noch SwitchWeaponAbility setzen den Wert selbst; sie gehoeren dem
+	 * WeaponModule und bleiben unangetastet, deshalb steht die Korrektur hier.
+	 *
+	 * @param Sekunden Dauer des Casts. Werte <= 0 werden ignoriert.
+	 */
+	void SetCastDuration(float Seconds);
+
+	/**
+	 * Waffenwechsel ueber die Faehigkeit statt ueber UWeaponComponent::Server_SwitchWeapon.
+	 *
+	 * Nur so gibt es Cast-Leiste, Wechsel-Montage und den Abklingring im HUD - der direkte Aufruf
+	 * tauscht die Waffe stumm aus. USwitchWeaponAbility::PerformSwitchWeapon schaltet dabei immer
+	 * auf die NAECHSTE Waffe; ein Zielindex laesst sich nicht uebergeben.
+	 *
+	 * @return true, wenn die Faehigkeit angestossen wurde.
+	 */
+	bool TryStartWeaponSwitchAbility();
+
 	UPROPERTY(BlueprintAssignable, Category = "MassShooter|Combat")
 	FMassShooterOnHitConfirmed OnHitConfirmed;
 
@@ -98,6 +124,10 @@ public:
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MassShooter|Combat|Abilities")
 	EGASAbilityInputID ReloadAbilitySlot = EGASAbilityInputID::AbilityTwo;
+
+	/** Slot der Waffenwechsel-Faehigkeit - dieselbe Reihenfolge wie oben, also Index 2. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MassShooter|Combat|Abilities")
+	EGASAbilityInputID SwitchWeaponAbilitySlot = EGASAbilityInputID::AbilityThree;
 
 	/** Spread half-angle (deg) when standing still, not aiming, having not fired for a while. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MassShooter|Combat|Spread")

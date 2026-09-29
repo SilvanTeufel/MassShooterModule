@@ -1,6 +1,8 @@
 // Copyright 2026 Silvan Teufel / Teufel-Engineering.com All Rights Reserved.
 
 #include "GameModes/MassShooterGameMode.h"
+#include "Controller/PlayerController/ControllerBase.h"
+#include "System/PlayerTeamSubsystem.h"
 #include "GameStates/MassShooterGameState.h"
 #include "PlayerState/MassShooterPlayerState.h"
 #include "Controller/MassShooterPlayerController.h"
@@ -20,6 +22,7 @@
 #include "GameFramework/PlayerStart.h"
 #include "GameFramework/GameStateBase.h"
 #include "Engine/World.h"
+#include "Engine/GameInstance.h"  // GetGameInstance()->GetSubsystem braucht den vollstaendigen Typ
 
 AMassShooterGameMode::AMassShooterGameMode()
 {
@@ -46,6 +49,7 @@ void AMassShooterGameMode::BeginPlay()
 	Super::BeginPlay();
 
 	CacheSpawners();
+	ApplyTeamAlliances();
 
 	if (AMassShooterGameState* GS = GetGameState<AMassShooterGameState>())
 	{
@@ -118,6 +122,13 @@ int32 AMassShooterGameMode::PickTeamForNewPlayer(AController* Joining) const
 
 			if (const AMassShooterPlayerState* ShooterState = Cast<AMassShooterPlayerState>(State.Get()))
 			{
+				// RTS AI commanders own a player state too. Counting them would make their team
+				// look full and push every human onto the other side.
+				if (ShooterState->bIsAiPlayer)
+				{
+					continue;
+				}
+
 				const int32 Index = ShooterState->ShooterTeamId - Settings->FirstPlayerTeamId;
 				if (Counts.IsValidIndex(Index))
 				{
@@ -292,6 +303,29 @@ void AMassShooterGameMode::HandleUnitDeath(AActor* Victim, AActor* Killer)
 	EvaluateEndConditions();
 }
 
+FString AMassShooterGameMode::ResolveVictimName(const AActor* Victim, const AMassShooterBot* VictimBot)
+{
+	// This module's own bots carry an authored kill-feed name.
+	if (VictimBot && !VictimBot->BotDisplayName.IsEmpty())
+	{
+		return VictimBot->BotDisplayName;
+	}
+
+	// A foreign RTS unit does not, but RTSUnitTemplate gives every unit an editable Name. "Unit"
+	// is that field's default and means nobody filled it in, so it is worth no more than the
+	// generic fallback - and the raw actor name (BP_UnitBase_Xeno_Skitterling_AH_C_3) is worse
+	// than either in a kill feed.
+	if (const AUnitBase* Unit = Cast<AUnitBase>(Victim))
+	{
+		if (!Unit->Name.IsEmpty() && Unit->Name != TEXT("Unit"))
+		{
+			return Unit->Name;
+		}
+	}
+
+	return TEXT("Hostile");
+}
+
 void AMassShooterGameMode::ScoreKill(AActor* Victim, AActor* Killer)
 {
 	AMassShooterGameState* GS = GetGameState<AMassShooterGameState>();
@@ -302,13 +336,20 @@ void AMassShooterGameMode::ScoreKill(AActor* Victim, AActor* Killer)
 
 	AMassShooterCharacter* VictimPlayer = Cast<AMassShooterCharacter>(Victim);
 	const AMassShooterBot* VictimBot = Cast<AMassShooterBot>(Victim);
-	const bool bVictimWasBot = VictimBot != nullptr;
+
+	// "Not a player" is exactly "a bot" here, and that is not a shortcut: this function only ever
+	// runs for actors carrying a UMassShooterHealthComponent, and only three kinds do - player
+	// pawns, this module's own AMassShooterBot, and foreign RTS units the spawner adapted for a
+	// wave (bAdaptForeignUnits). Testing for AMassShooterBot alone therefore scored every
+	// Xenocrypta wave unit as a PLAYER kill: 2 points instead of 1, counted in Kills instead of
+	// BotKills. Measured on Level_14 - one Skitterling kill, MatchScore 2, BotKills 0.
+	const bool bVictimWasBot = (VictimPlayer == nullptr);
 
 	const int32 VictimTeam = GetActorTeamId(Victim);
 	const int32 KillerTeam = GetActorTeamId(Killer);
 
 	// ---- Victim bookkeeping -------------------------------------------------------------------
-	FString VictimName = bVictimWasBot ? VictimBot->BotDisplayName : FString(TEXT("Unknown"));
+	FString VictimName = ResolveVictimName(Victim, VictimBot);
 
 	if (VictimPlayer)
 	{
@@ -335,7 +376,8 @@ void AMassShooterGameMode::ScoreKill(AActor* Victim, AActor* Killer)
 		}
 		else if (bVictimWasBot)
 		{
-			ScoreValue = VictimBot->ScoreValue > 0 ? VictimBot->ScoreValue : ScorePerBotKill;
+			// A foreign wave unit has no per-unit ScoreValue, so it falls back to the mode's rate.
+			ScoreValue = (VictimBot && VictimBot->ScoreValue > 0) ? VictimBot->ScoreValue : ScorePerBotKill;
 		}
 		else
 		{
@@ -566,8 +608,43 @@ void AMassShooterGameMode::SpawnNextWave()
 		Remaining -= Spawner->SpawnWave(Count, Scaling, Scaling);
 	}
 
-	UE_LOG(LogMassShooterMatch, Log, TEXT("Wave %d: %d bots requested (scaling %.2f)."),
-		GS->CurrentWave, Budget, Scaling);
+	// Count again NOW, not on the next 2 s sweep. The early-release trigger in Tick reads
+	// GS->BotsAlive, and leaving it at the pre-spawn value meant "field nearly clear" stayed true
+	// for every frame until BotScanTimer caught up - so the wave after an emptied field fired
+	// again on the very next frame. Measured: waves 4 and 5 25 ms apart.
+	RefreshBotCount();
+
+	UE_LOG(LogMassShooterMatch, Log, TEXT("Wave %d: %d bots requested (scaling %.2f, %d alive)."),
+		GS->CurrentWave, Budget, Scaling, GS->BotsAlive);
+}
+
+void AMassShooterGameMode::MarkAiPlayerStates()
+{
+	if (!GameState)
+	{
+		return;
+	}
+
+	// Stamped from a sweep rather than at creation time: the AI player controllers are made by
+	// ARTSGameModeBase, which this module does not modify and cannot hook, and their bIsAi is set
+	// after the controller (and its player state) already exist. Once true it stays true, so the
+	// work is one cast per player state per two seconds and stops mattering after the first pass.
+	for (const TObjectPtr<APlayerState>& State : GameState->PlayerArray)
+	{
+		AMassShooterPlayerState* ShooterState = Cast<AMassShooterPlayerState>(State.Get());
+		if (!ShooterState || ShooterState->bIsAiPlayer)
+		{
+			continue;
+		}
+
+		if (const AControllerBase* Controller = Cast<AControllerBase>(ShooterState->GetOwningController()))
+		{
+			if (Controller->bIsAi)
+			{
+				ShooterState->bIsAiPlayer = true;
+			}
+		}
+	}
 }
 
 void AMassShooterGameMode::RefreshBotCount()
@@ -657,6 +734,7 @@ void AMassShooterGameMode::Tick(float DeltaSeconds)
 	{
 		BotScanTimer = 0.f;
 		RefreshBotCount();
+		MarkAiPlayerStates();
 	}
 
 	switch (GS->MatchPhase)
@@ -692,7 +770,14 @@ void AMassShooterGameMode::Tick(float DeltaSeconds)
 
 			// Send the next wave on the clock, or early once the field is nearly clear — waiting
 			// out the full timer with two bots left is dead air.
-			const bool bFieldNearlyClear = GS->CurrentWave > 0 && GS->BotsAlive <= 2;
+			//
+			// The early release is floored by MinSecondsBetweenWaves as a second line of defence:
+			// refreshing the count above fixes the case where the bots DID spawn, but a spawn that
+			// yields nothing (no spawn table, every SpawnOne failing) would otherwise re-trigger
+			// this branch every frame and march the wave counter - and its scaling - upwards
+			// without a single bot on the field.
+			const bool bFieldNearlyClear = GS->CurrentWave > 0 && GS->BotsAlive <= 2
+				&& WaveTimer >= MinSecondsBetweenWaves;
 			if (WaveTimer >= SecondsBetweenWaves || GS->CurrentWave == 0 || bFieldNearlyClear)
 			{
 				WaveTimer = 0.f;
@@ -710,5 +795,40 @@ void AMassShooterGameMode::Tick(float DeltaSeconds)
 			RestartMatch();
 		}
 		break;
+	}
+}
+
+void AMassShooterGameMode::ApplyTeamAlliances()
+{
+	if (TeamAlliances.Num() == 0 || !HasAuthority())
+	{
+		return;
+	}
+
+	const UGameInstance* GI = GetGameInstance();
+	UPlayerTeamSubsystem* Teams = GI ? GI->GetSubsystem<UPlayerTeamSubsystem>() : nullptr;
+	if (!Teams)
+	{
+		return;
+	}
+
+	for (const FMassShooterTeamAlliance& Pair : TeamAlliances)
+	{
+		if (Pair.TeamA == Pair.TeamB)
+		{
+			continue;
+		}
+
+		// A team id of 64 or more cannot be represented in the int64 mask. Saying so once is worth
+		// more than a silently inert alliance.
+		if (Pair.TeamA < 0 || Pair.TeamA >= 64 || Pair.TeamB < 0 || Pair.TeamB >= 64)
+		{
+			UE_LOG(LogMassShooterMatch, Warning,
+				TEXT("Alliance %d/%d ignored: team ids must be in 0..63 to fit the allied mask."),
+				Pair.TeamA, Pair.TeamB);
+			continue;
+		}
+
+		Teams->SetTeamsAllied(Pair.TeamA, Pair.TeamB, /*bAllied*/ true);
 	}
 }

@@ -28,6 +28,22 @@ public:
 	virtual void CopyProperties(APlayerState* PlayerState) override;
 
 	/** Which team this player fights for. Mirrored onto the controller and the pawn. */
+	/**
+	 * True for a player state that belongs to an RTS AI commander, not a person.
+	 *
+	 * ARTSGameModeBase creates a full APlayerController for every PlayerStart marked bIsAi, and the
+	 * engine gives each one a PlayerState of the game mode's PlayerStateClass - so on Level_14 the
+	 * four Xeno AIs and the allied Singularian AI each add a row to GameState::PlayerArray. Left
+	 * unmarked they showed up as five empty scoreboard lines on the human's screen and counted
+	 * toward team balancing.
+	 *
+	 * The flag lives HERE and replicates on purpose: AControllerBase::bIsAi is not replicated, and
+	 * the AI controllers do not exist on a client at all - so a client-side scoreboard cannot ask
+	 * the controller. It can only ask the player state, which always replicates.
+	 */
+	UPROPERTY(Replicated, BlueprintReadOnly, Category = "MassShooter")
+	bool bIsAiPlayer = false;
+
 	UPROPERTY(Replicated, BlueprintReadOnly, Category = "MassShooter")
 	int32 ShooterTeamId = 1;
 
